@@ -1,11 +1,15 @@
 package com.visioncameratextrecognition
 
-import android.graphics.Point
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.ImageFormat
+import android.graphics.Matrix
 import android.graphics.Rect
+import android.graphics.YuvImage
 import android.media.Image
+import android.util.Log
 import com.facebook.react.bridge.WritableNativeArray
 import com.facebook.react.bridge.WritableNativeMap
-import com.google.android.gms.tasks.Task
 import com.google.android.gms.tasks.Tasks
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.Text
@@ -18,10 +22,16 @@ import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import com.mrousavy.camera.frameprocessors.Frame
 import com.mrousavy.camera.frameprocessors.FrameProcessorPlugin
 import com.mrousavy.camera.frameprocessors.VisionCameraProxy
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileOutputStream
 import java.util.HashMap
 
 class VisionCameraTextRecognitionPlugin(proxy: VisionCameraProxy, options: Map<String, Any>?) :
     FrameProcessorPlugin() {
+
+    // Utilisez proxy.context au lieu de proxy.reactContext
+    private val context = proxy.context
 
     private var recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
     private val latinOptions = TextRecognizerOptions.DEFAULT_OPTIONS
@@ -29,6 +39,12 @@ class VisionCameraTextRecognitionPlugin(proxy: VisionCameraProxy, options: Map<S
     private val devanagariOptions = DevanagariTextRecognizerOptions.Builder().build()
     private val japaneseOptions = JapaneseTextRecognizerOptions.Builder().build()
     private val koreanOptions = KoreanTextRecognizerOptions.Builder().build()
+
+    private val roiX = (options?.get("roiX") as? Number)?.toInt()
+    private val roiY = (options?.get("roiY") as? Number)?.toInt()
+    private val roiWidth = (options?.get("roiWidth") as? Number)?.toInt()
+    private val roiHeight = (options?.get("roiHeight") as? Number)?.toInt()
+    private var lastProcessedTime: Long = 0
 
     init {
         val language = options?.get("language").toString()
@@ -43,13 +59,22 @@ class VisionCameraTextRecognitionPlugin(proxy: VisionCameraProxy, options: Map<S
     }
 
     override fun callback(frame: Frame, arguments: Map<String, Any>?): HashMap<String, Any>? {
+        val currentTime = System.currentTimeMillis()
+      
+        if (currentTime - lastProcessedTime < 500) {
+            return WritableNativeMap().toHashMap()
+        }
+        lastProcessedTime = currentTime
+
         val data = WritableNativeMap()
         val mediaImage: Image = frame.image
         val image =
             InputImage.fromMediaImage(mediaImage, frame.imageProxy.imageInfo.rotationDegrees)
-        val task: Task<Text> = recognizer.process(image)
+
+        val task = recognizer.process(image)
+
         try {
-            val text: Text = Tasks.await(task)
+            val text = Tasks.await(task)
             if (text.text.isEmpty()) {
                 return WritableNativeMap().toHashMap()
             }
@@ -60,8 +85,67 @@ class VisionCameraTextRecognitionPlugin(proxy: VisionCameraProxy, options: Map<S
             e.printStackTrace()
             return null
         }
+
     }
 
+
+    /**
+     * Applique la rotation sur le Bitmap source.
+     */
+    private fun rotateBitmap(source: Bitmap, angle: Float): Bitmap {
+        val matrix = Matrix()
+        matrix.postRotate(angle)
+        return Bitmap.createBitmap(source, 0, 0, source.width, source.height, matrix, true)
+    }
+
+    /**
+     * Enregistre le Bitmap dans le dossier "debug_cropped_images" du stockage privé de l'application.
+     * Renvoie le chemin absolu vers le fichier ou null en cas d'erreur.
+     */
+    private fun saveBitmapToFile(bitmap: Bitmap, name:String): String? {
+        return try {
+            val dir = File(context.getExternalFilesDir(null), "debug_cropped_images")
+            if (!dir.exists()) {
+                dir.mkdirs()
+            }
+            val file = File(dir, "${name}_${System.currentTimeMillis()}.png")
+            val fos = FileOutputStream(file)
+            bitmap.compress(Bitmap.CompressFormat.PNG, 100, fos)
+            fos.flush()
+            fos.close()
+            file.absolutePath
+        } catch (e: Exception) {
+            e.printStackTrace()
+            null
+        }
+    }
+
+    /**
+     * Convertit l'image YUV en Bitmap.
+     * Notez que l'ordre des buffers U et V peut varier selon l'appareil.
+     */
+    private fun yuv420ToBitmap(image: Image): Bitmap {
+        val yBuffer = image.planes[0].buffer
+        val uBuffer = image.planes[1].buffer
+        val vBuffer = image.planes[2].buffer
+        val ySize = yBuffer.remaining()
+        val uSize = uBuffer.remaining()
+        val vSize = vBuffer.remaining()
+
+        val nv21 = ByteArray(ySize + uSize + vSize)
+        yBuffer.get(nv21, 0, ySize)
+        // Ici, nous plaçons V avant U
+        vBuffer.get(nv21, ySize, vSize)
+        uBuffer.get(nv21, ySize + vSize, uSize)
+
+        val yuvImage = YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null)
+        val out = ByteArrayOutputStream()
+        yuvImage.compressToJpeg(Rect(0, 0, image.width, image.height), 100, out)
+        val imageBytes = out.toByteArray()
+        return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+    }
+
+    // Suite des méthodes pour le mapping des blocs de texte
     companion object {
         fun getBlocks(blocks: MutableList<Text.TextBlock>): WritableNativeArray {
             val blockArray = WritableNativeArray()
@@ -86,7 +170,8 @@ class VisionCameraTextRecognitionPlugin(proxy: VisionCameraProxy, options: Map<S
                     putMap("lineFrame", getFrame(line.boundingBox))
                     putArray(
                         "lineLanguages",
-                        WritableNativeArray().apply { pushString(line.recognizedLanguage) })
+                        WritableNativeArray().apply { pushString(line.recognizedLanguage) }
+                    )
                     putArray("elements", getElements(line.elements))
                 }
                 lineArray.pushMap(lineMap)
@@ -99,9 +184,7 @@ class VisionCameraTextRecognitionPlugin(proxy: VisionCameraProxy, options: Map<S
             elements.forEach { element ->
                 val elementMap = WritableNativeMap().apply {
                     putString("elementText", element.text)
-                    putArray(
-                        "elementCornerPoints",
-                        element.cornerPoints?.let { getCornerPoints(it) })
+                    putArray("elementCornerPoints", element.cornerPoints?.let { getCornerPoints(it) })
                     putMap("elementFrame", getFrame(element.boundingBox))
                 }
                 elementArray.pushMap(elementMap)
@@ -109,7 +192,7 @@ class VisionCameraTextRecognitionPlugin(proxy: VisionCameraProxy, options: Map<S
             return elementArray
         }
 
-        private fun getCornerPoints(points: Array<Point>): WritableNativeArray {
+        private fun getCornerPoints(points: Array<android.graphics.Point>): WritableNativeArray {
             val cornerPoints = WritableNativeArray()
             points.forEach { point ->
                 cornerPoints.pushMap(WritableNativeMap().apply {
@@ -134,5 +217,3 @@ class VisionCameraTextRecognitionPlugin(proxy: VisionCameraProxy, options: Map<S
         }
     }
 }
-
-
